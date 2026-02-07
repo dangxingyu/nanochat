@@ -10,4 +10,5 @@ eval_bundle/
 
 # Local setup
 CLAUDE.md
+cache
 wandb/

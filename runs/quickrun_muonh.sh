@@ -17,7 +17,7 @@ set -e
 # Config
 
 DEPTH="${DEPTH:-26}"
-NUM_SHARDS="${NUM_SHARDS:-370}"      # default for d24 @ ratio~11
+NUM_SHARDS="${NUM_SHARDS:-400}"      # default for d24 @ ratio~11
 TARGET_RATIO="${TARGET_RATIO:-8.25}"
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
@@ -43,7 +43,7 @@ NORM_LR="${NORM_LR:-0.1}"
 # Wandb
 export WANDB_ENTITY="xingyu20"
 export WANDB_PROJECT="nanochat"
-WANDB_RUN="${WANDB_RUN:-muonh_d${DEPTH}_ratio${TARGET_RATIO}_normlr${NORM_LR}_final}"
+WANDB_RUN="${WANDB_RUN:-muonh_d${DEPTH}_ratio${TARGET_RATIO}_matrix_down${MATRIX_WARMDOWN_RATIO}_depthratio}"
 MODEL_TAG="${MODEL_TAG:-d${DEPTH}_gamma_muonh}"
 
 # FP8 (default enabled)

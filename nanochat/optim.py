@@ -179,6 +179,9 @@ def hyperball_step_fused(
     """
 
     # Nesterov momentum
+    p_new_norm = stacked_params.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+    stacked_params.mul_(p_norm / p_new_norm)
+
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
@@ -216,8 +219,6 @@ def hyperball_step_fused(
     stacked_params.sub_(lr * u)
 
     # Project back to hypersphere: p = p * (||p_orig|| / ||p_new||)
-    p_new_norm = stacked_params.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
-    stacked_params.mul_(p_norm / p_new_norm)
 
 # -----------------------------------------------------------------------------
 # Single GPU version of the MuonAdamW optimizer.

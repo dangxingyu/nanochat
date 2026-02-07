@@ -322,12 +322,12 @@ if args.depth != 12:
 adam_betas = (args.adam_beta1, args.adam_beta2)
 matrix_lr_scaled = args.matrix_lr * batch_lr_scale
 
-# LR depth scaling for Hyperball
+# LR scaling (data scaling)
 if args.matrix_optimizer == "hyperball":
-    hyperball_depth_scale = 12 / args.depth
-    matrix_lr_scaled = matrix_lr_scaled * hyperball_depth_scale
-    if args.depth != 12:
-        print0(f"Scaling hyperball LR from {args.matrix_lr * batch_lr_scale:.6f} to {matrix_lr_scaled:.6f} for depth {args.depth}")
+    # data_ratio = D_REF / target_tokens 
+    depth_ratio = 12 / args.depth
+    matrix_lr_scaled = matrix_lr_scaled * (depth_ratio)
+    print0(f"Scaling hyperball LR from {args.matrix_lr * batch_lr_scale:.6f} to {matrix_lr_scaled:.6f} for depth ratio {depth_ratio:.4f}")
 
 optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
@@ -369,9 +369,10 @@ def get_lr_multiplier(it, warmup_ratio, warmdown_ratio, final_lr_frac):
 
 # Momentum scheduler for matrix optimizer (Muon/Hyperball)
 def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
+    # frac = min(it / 300, 1)
+    # momentum = (1 - frac) * 0.85 + frac * 0.95
+    # return momentum
+    return 0.95
 
 # Weight decay scheduler for Muon optimizer (linear to zero over the course of training)
 def get_weight_decay(it):
