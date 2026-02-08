@@ -369,9 +369,7 @@ def get_lr_multiplier(it, warmup_ratio, warmdown_ratio, final_lr_frac):
 
 # Momentum scheduler for matrix optimizer (Muon/Hyperball)
 def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
+    return 0.95
 
 # Weight decay scheduler for Muon optimizer (linear to zero over the course of training)
 def get_weight_decay(it):
