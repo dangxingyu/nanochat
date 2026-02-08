@@ -48,6 +48,10 @@ Also refactored model initialization to use `build_model_meta(depth)` helper and
 - [Brown et al., Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
 - [Merrill et al., The Batch Size–Critical Batch Size Myth](https://arxiv.org/abs/2505.23971)
 
+### One more thing (batch size ramp)
+
+Tried batch size ramping. The simplest implementation I could think of "tricks" the existing training loop by slicing each micro-batch into smaller pieces and calling optimizer.step() more frequently early in training (1/8 → 1/4 → 1/2 → full batch over the first x% of training, with sqrt LR scaling). Also required a torch.compile warmup phase to pre-compile all slice sizes and avoid recompilation spikes during training. While the idea is sound and small gains were observed, they weren't sufficient to justify the code complexity introduced (conditional slicing logic, warmup with state save/restore, etc.). Not merged for now.
+
 ---
 
 ## 2026-02-05: SwiGLU Activation (Negative Result)
