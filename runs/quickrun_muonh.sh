@@ -41,8 +41,8 @@ UNEMBEDDING_LR="${UNEMBEDDING_LR:-0.004}"
 NORM_LR="${NORM_LR:-0.1}"
 
 # Wandb
-export WANDB_ENTITY="xingyu20"
-export WANDB_PROJECT="nanochat"
+export WANDB_ENTITY="${WANDB_ENTITY:-xingyu20}"
+export WANDB_PROJECT="${WANDB_PROJECT:-nanochat}"
 WANDB_RUN="${WANDB_RUN:-muonh_d${DEPTH}_ratio${TARGET_RATIO}_normlr${NORM_LR}_final}"
 MODEL_TAG="${MODEL_TAG:-d${DEPTH}_gamma_muonh}"
 
@@ -114,8 +114,13 @@ echo "Downloading $NUM_SHARDS data shards..."
 python -m nanochat.dataset -n "$NUM_SHARDS"
 
 echo ""
-echo "Checking tokenizer..."
-python -m scripts.tok_train --max-chars=500000000 --vocab-size=32768
+TOKENIZER_DIR="$NANOCHAT_BASE_DIR/tokenizer"
+if [ -f "$TOKENIZER_DIR/token_bytes.pt" ]; then
+    echo "Tokenizer already exists at $TOKENIZER_DIR, skipping training."
+else
+    echo "Training tokenizer..."
+    python -m scripts.tok_train --max-chars=500000000 --vocab-size=32768
+fi
 
 # -----------------------------------------------------------------------------
 # Train
@@ -139,9 +144,9 @@ TRAIN_ARGS=(
     --unembedding-lr=$UNEMBEDDING_LR
     --norm-lr=$NORM_LR
     --scalar-lr=$SCALAR_LR
-    --core-metric-every=2000
-    --sample-every=-1
-    --save-every=-1
+    --core-metric-every=${CORE_METRIC_EVERY:-2000}
+    --sample-every=${SAMPLE_EVERY:--1}
+    --save-every=${SAVE_EVERY:--1}
 )
 
 if [ "$NPROC_PER_NODE" -gt 1 ]; then

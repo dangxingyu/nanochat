@@ -101,7 +101,8 @@ else:
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_project = os.environ.get("WANDB_PROJECT", "nanochat")
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=wandb_project, name=args.run, config=user_config)
 
 # Flash Attention status
 if HAS_FA3:
@@ -264,7 +265,7 @@ target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
 d12_ref = build_model_meta(12) # creates the model on meta device
-D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
+D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically) Shall we use a constant ratio for computing D_REF?
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
 # 2) Now that we have the token horizon, we can calculate the optimal batch size
@@ -301,12 +302,12 @@ if weight_decay_scaled != args.weight_decay:
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 matrix_lr_scaled = args.matrix_lr * batch_lr_scale
 
-# LR depth scaling for Hyperball
+# LR data scaling for Hyperball
+# We keep the same D_REF here
 if args.matrix_optimizer == "hyperball":
-    hyperball_depth_scale = 12 / args.depth
-    matrix_lr_scaled = matrix_lr_scaled * hyperball_depth_scale
+    matrix_lr_scaled = matrix_lr_scaled * (D_REF / target_tokens) ** 0.33 # 0.33 is the exponent for the power law fit by ourselves 
     if args.depth != 12:
-        print0(f"Scaling hyperball LR from {args.matrix_lr * batch_lr_scale:.6f} to {matrix_lr_scaled:.6f} for depth {args.depth}")
+        print0(f"Scaling hyperball LR from {args.matrix_lr * batch_lr_scale:.6f} to {matrix_lr_scaled:.6f} for token ratio {target_tokens / D_REF:.2f} (T_train = {target_tokens:,} tokens)")
 
 optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
