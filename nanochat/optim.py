@@ -183,6 +183,9 @@ def hyperball_step_fused(
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
+    # tangent momentum
+    g = g - (g * stacked_params).sum(dim=(-2, -1), keepdim=True) * stacked_params / (p_norm ** 2 + 1e-10)
+
     # Polar express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -211,11 +214,6 @@ def hyperball_step_fused(
     g = g * final_scale.to(g.dtype)
     u = g.to(stacked_params.dtype)
 
-    # cautious update
-    mask = (u * stacked_grads) >= 0
-    u = u * mask 
-    # u = u / (mask.to(u.dtype).mean(dim=(-2, -1), keepdim=True) + 1e-10)
-    u = u * p_norm / (u.norm(dim=(-2, -1), keepdim=True) + 1e-10)
 
     # Scale-invariant update: keeps ||p|| constant
     lr = lr_t.to(stacked_params.dtype)
