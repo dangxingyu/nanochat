@@ -100,7 +100,6 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-        self.v_proj_scalar = nn.Parameter(torch.zeros(self.n_kv_head)) if has_ve(layer_idx, config.n_layer) else None
         self.c_proj_scalar = nn.Parameter(torch.zeros(config.n_embd))
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, gamma):
@@ -263,13 +262,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.attn.c_proj_scalar.fill_(0.0)
             block.mlp.c_proj_scalar.fill_(0.0)
-            if block.attn.v_proj_scalar is not None:
-                block.attn.v_proj_scalar.fill_(0.0)
             if self.transformer.wte.weight.device.type == "cuda":
                 block.attn.c_proj_scalar.data = block.attn.c_proj_scalar.data.to(torch.bfloat16)
                 block.mlp.c_proj_scalar.data = block.mlp.c_proj_scalar.data.to(torch.bfloat16)
-                if block.attn.v_proj_scalar is not None:
-                    block.attn.v_proj_scalar.data = block.attn.v_proj_scalar.data.to(torch.bfloat16)
 
         # Block gamma parameters (cast to bf16)
         for block in self.transformer.h:
