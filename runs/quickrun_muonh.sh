@@ -16,9 +16,9 @@ set -e
 # -----------------------------------------------------------------------------
 # Config
 
-DEPTH="${DEPTH:-26}"
+DEPTH="${DEPTH:-24}"
 NUM_SHARDS="${NUM_SHARDS:-370}"      # default for d24 @ ratio~11
-TARGET_RATIO="${TARGET_RATIO:-8.25}"
+TARGET_RATIO="${TARGET_RATIO:-12}"
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
 TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:--1}"  # -1 = auto-compute optimal (Power Lines paper)
@@ -38,7 +38,7 @@ MATRIX_WARMDOWN_RATIO="${MATRIX_WARMDOWN_RATIO:-1.0}"
 # AdamW
 EMBEDDING_LR="${EMBEDDING_LR:-0.3}"
 UNEMBEDDING_LR="${UNEMBEDDING_LR:-0.004}"
-NORM_LR="${NORM_LR:-0.1}"
+NORM_LR="${NORM_LR:-0.5}"
 
 # Wandb
 export WANDB_ENTITY="${WANDB_ENTITY:-xingyu20}"
