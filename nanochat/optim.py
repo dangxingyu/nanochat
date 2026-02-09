@@ -214,7 +214,7 @@ def hyperball_step_fused(
     # cautious update
     mask = (u * stacked_params) >= 0
     u = u * mask 
-    u = u * p_norm / (u.mean() + 1e-10)
+    u = u / (u.mean() + 1e-10)
 
     # Scale-invariant update: keeps ||p|| constant
     lr = lr_t.to(stacked_params.dtype)
