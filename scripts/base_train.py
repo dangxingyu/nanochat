@@ -69,6 +69,7 @@ parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 fo
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for AdamW LR warmdown")
+parser.add_argument("--matrix-warmup-ratio", type=float, default=0.0, help="ratio of iterations for Muon/Hyperball LR warmup")
 parser.add_argument("--matrix-warmdown-ratio", type=float, default=1.0, help="ratio of iterations for Muon/Hyperball LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
@@ -509,7 +510,7 @@ while True:
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm_adam = get_lr_multiplier(step, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
-    lrm_matrix = get_lr_multiplier(step, 0.0, args.matrix_warmdown_ratio, args.final_lr_frac)
+    lrm_matrix = get_lr_multiplier(step, args.matrix_warmup_ratio, args.matrix_warmdown_ratio, args.final_lr_frac)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
@@ -598,6 +599,7 @@ get_report().log(section="Base model training", data=[
         "DDP world size": ddp_world_size,
         "warmup_ratio": args.warmup_ratio,
         "warmdown_ratio": args.warmdown_ratio,
+        "matrix_warmup_ratio": args.matrix_warmup_ratio,
         "matrix_warmdown_ratio": args.matrix_warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,
     },
