@@ -211,6 +211,11 @@ def hyperball_step_fused(
     g = g * final_scale.to(g.dtype)
     u = g.to(stacked_params.dtype)
 
+    # cautious update
+    mask = (u * stacked_params) >= 0
+    u = u * mask 
+    u = u * p_norm / (u.norm(dim=(-2, -1), keepdim=True) + 1e-10)
+
     # Scale-invariant update: keeps ||p|| constant
     lr = lr_t.to(stacked_params.dtype)
     stacked_params.sub_(lr * u)
