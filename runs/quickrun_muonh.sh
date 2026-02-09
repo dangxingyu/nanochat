@@ -16,7 +16,7 @@ set -e
 # -----------------------------------------------------------------------------
 # Config
 
-DEPTH="${DEPTH:-24}"
+DEPTH="${DEPTH:-12}"
 NUM_SHARDS="${NUM_SHARDS:-370}"      # default for d24 @ ratio~11
 TARGET_RATIO="${TARGET_RATIO:-12}"
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
