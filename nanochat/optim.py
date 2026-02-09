@@ -212,7 +212,7 @@ def hyperball_step_fused(
     u = g.to(stacked_params.dtype)
 
     # cautious update
-    mask = (u * stacked_params) >= 0
+    mask = (u * stacked_grads) >= 0
     u = u * mask 
     u = u / (mask.to(u.dtype).mean(dim=(-2, -1), keepdim=True) + 1e-10)
 
