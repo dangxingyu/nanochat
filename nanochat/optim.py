@@ -146,6 +146,21 @@ def muon_step_fused(
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
 # -----------------------------------------------------------------------------
+# Module-wise gradient clipping: clip each parameter's gradient independently by its own norm.
+
+def clip_grad_module_wise_1d(grad: Tensor, max_norm: float) -> None:
+    """Clip a single gradient tensor in-place by its own norm."""
+    grad_norm = grad.norm()
+    clip_coef = (max_norm / (grad_norm + 1e-6)).clamp_max_(1.0)
+    grad.mul_(clip_coef)
+
+def clip_grad_module_wise_stacked(stacked_grads: Tensor, max_norm: float) -> None:
+    """Clip each (M, N) slice in a (K, M, N) stacked gradient tensor independently."""
+    grad_norms = stacked_grads.norm(dim=(-2, -1), keepdim=True)  # (K, 1, 1)
+    clip_coef = (max_norm / (grad_norms + 1e-6)).clamp_max_(1.0)
+    stacked_grads.mul_(clip_coef)
+
+# -----------------------------------------------------------------------------
 """
 Hyperball optimizer (MuonH): Muon with scale-invariant updates.
 https://github.com/marin-community/marin/blob/main/lib/levanter/src/levanter/optim/muonh.py
@@ -250,8 +265,9 @@ class MuonAdamW(torch.optim.Optimizer):
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
             - For Hyperball groups: 'lr', 'momentum', 'ns_steps', 'beta2'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], max_grad_norm: float = 0.0):
         super().__init__(param_groups, defaults={})
+        self.max_grad_norm = max_grad_norm
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         # AdamW tensors
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -279,6 +295,8 @@ class MuonAdamW(torch.optim.Optimizer):
             if p.grad is None:
                 continue
             grad = p.grad
+            if self.max_grad_norm > 0:
+                clip_grad_module_wise_1d(grad, self.max_grad_norm)
             state = self.state[p]
 
             # State init
@@ -335,6 +353,8 @@ class MuonAdamW(torch.optim.Optimizer):
         # Stack grads and params (NOTE: this assumes all params have the same shape)
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
+        if self.max_grad_norm > 0:
+            clip_grad_module_wise_stacked(stacked_grads, self.max_grad_norm)
 
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
@@ -377,6 +397,8 @@ class MuonAdamW(torch.optim.Optimizer):
         # Stack grads and params (NOTE: this assumes all params have the same shape)
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
+        if self.max_grad_norm > 0:
+            clip_grad_module_wise_stacked(stacked_grads, self.max_grad_norm)
 
         # Momentum buffer for every individual parameter
         if "momentum_buffer" not in state:
@@ -492,8 +514,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
             - For Hyperball groups: 'lr', 'momentum', 'ns_steps', 'beta2'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], max_grad_norm: float = 0.0):
         super().__init__(param_groups, defaults={})
+        self.max_grad_norm = max_grad_norm
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -556,6 +579,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
             pinfo = param_infos[p]
             pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']
+            if self.max_grad_norm > 0:
+                clip_grad_module_wise_1d(grad_slice, self.max_grad_norm)
             state = self.state[p]
 
             # For small params, operate on full param; for large, operate on slice
@@ -596,6 +621,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         params = group['params']
         chunk_size = info['chunk_size']
         grad_chunk = info['grad_chunk']
+        if self.max_grad_norm > 0:
+            clip_grad_module_wise_stacked(grad_chunk, self.max_grad_norm)
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
 
@@ -667,6 +694,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         params = group['params']
         chunk_size = info['chunk_size']
         grad_chunk = info['grad_chunk']
+        if self.max_grad_norm > 0:
+            clip_grad_module_wise_stacked(grad_chunk, self.max_grad_norm)
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
 

@@ -122,7 +122,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
-
+        
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
@@ -143,8 +143,14 @@ class CausalSelfAttention(nn.Module):
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream (scalar folded into weight)
+        # Decompose: c_proj(norm(y)) ≡ c_proj(y) / rms(y), since rms(y) is a per-row scalar
+        # This lets rms(y) be a separate cheap reduction, while the elementwise multiply
+        # fuses with downstream ops (residual add → lambda blend → MLP pre-norm)
         y = y.contiguous().view(B, T, -1)
+        # rms_y = (y.float().square().mean(dim=-1, keepdim=True) + 1e-5).rsqrt()  # float32, match F.rms_norm eps
         y = reparam_linear(self.c_proj, y, scalar=self.c_proj_scalar)
+        # y = y.float() * rms_y  # multiply in float32 to match norm-before-matmul precision
+        y = y.to(self.c_proj.weight.dtype)
         return y
 
 
@@ -453,7 +459,7 @@ class GPT(nn.Module):
                 ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
-        optimizer = Factory(param_groups)
+        optimizer = Factory(param_groups, max_grad_norm=0.1)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
