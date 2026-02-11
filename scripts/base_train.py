@@ -307,7 +307,7 @@ matrix_lr_scaled = args.matrix_lr * batch_lr_scale
 # We keep the same D_REF here
 if args.matrix_optimizer == "hyperball":
     D_REF_LR = 12 * get_scaling_params(d12_ref) 
-    matrix_lr_scaled = matrix_lr_scaled * (D_REF_LR / target_tokens) ** 0.33 # 0.33 is the exponent for the power law fit by ourselves 
+    matrix_lr_scaled = matrix_lr_scaled * (D_REF_LR / target_tokens) ** 0.35 # 0.35 is the exponent for the power law fit by ourselves 
     if args.depth != 12:
         print0(f"Scaling hyperball LR from {args.matrix_lr * batch_lr_scale:.6f} to {matrix_lr_scaled:.6f} for token ratio {target_tokens / D_REF:.2f} (T_train = {target_tokens:,} tokens)")
 
