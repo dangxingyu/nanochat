@@ -16,12 +16,12 @@ set -e
 # -----------------------------------------------------------------------------
 # Config
 
-DEPTH="${DEPTH:-24}"
+DEPTH="${DEPTH:-26}"
 NUM_SHARDS="${NUM_SHARDS:-370}"      # default for d24 @ ratio~11
-TARGET_RATIO="${TARGET_RATIO:-12}"
+TARGET_RATIO="${TARGET_RATIO:-8.25}"
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
-TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"  # -1 = auto-compute optimal (Power Lines paper)
+TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:--1}"  # -1 = auto-compute optimal (Power Lines paper)
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)}"
 if [ "$NPROC_PER_NODE" -eq 0 ]; then
@@ -43,7 +43,7 @@ NORM_LR="${NORM_LR:-0.1}"
 # Wandb
 export WANDB_ENTITY="${WANDB_ENTITY:-xingyu20}"
 export WANDB_PROJECT="${WANDB_PROJECT:-nanochat}"
-WANDB_RUN="${WANDB_RUN:-muonh_d${DEPTH}_ratio${TARGET_RATIO}_feb_11_0.5M_no_gamma}"
+WANDB_RUN="${WANDB_RUN:-muonh_d${DEPTH}_ratio${TARGET_RATIO}_feb_11_no_gamma}"
 MODEL_TAG="${MODEL_TAG:-d${DEPTH}_gamma_muonh}"
 
 # FP8 (default enabled)c
