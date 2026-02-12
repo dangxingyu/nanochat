@@ -1,16 +1,6 @@
 #!/bin/bash
 
-# Stack training: train a 6-layer seed model for 1 TPP, then stack layers to target depth
-# and continue training. Everything happens in a single process, in-memory.
-#
-# The seed model uses d12 width (768 dim, 6 heads).
-# After seed training, layers are stacked as [0,1,2,3,4,5, 0,1,2,3,4,5, ...].
-# Optimizer state is properly duplicated and re-sharded across ranks.
-#
-# Examples:
-#   bash runs/stack_train.sh                     # default: stack 6->24
-#   TARGET_DEPTH=12 bash runs/stack_train.sh     # stack 6->12
-#   TARGET_DEPTH=48 bash runs/stack_train.sh     # stack 6->48
+# Debug: Stack 6 -> 12 with seed TPP=2.0
 
 set -e
 
@@ -47,7 +37,7 @@ NORM_LR="${NORM_LR:-0.1}"
 # Wandb
 export WANDB_ENTITY="${WANDB_ENTITY:-xingyu20}"
 export WANDB_PROJECT="${WANDB_PROJECT:-nanochat}"
-WANDB_RUN="${WANDB_RUN:-stack_d${SEED_DEPTH}_to_d${TARGET_DEPTH}}"
+WANDB_RUN="${WANDB_RUN:-stack_6_12_debug}"
 
 # FP8 (default enabled)
 FP8="${FP8:-1}"
@@ -76,7 +66,7 @@ mkdir -p "$NANOCHAT_BASE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$T
 # Print summary
 
 echo "=============================================="
-echo "Stack Training (in-memory)"
+echo "Stack Training Debug: 6 -> 12"
 echo "=============================================="
 echo "Project root:      $PROJECT_ROOT"
 echo "Seed depth:        $SEED_DEPTH (n_embd=$N_EMBD)"
@@ -122,10 +112,10 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Train (single script, both phases in-memory)
+# Train
 
 echo ""
-echo "Starting stack training (seed -> stack -> continue)..."
+echo "Starting stack training (6 -> 12, seed TPP=2.0)..."
 
 TRAIN_ARGS=(
     --seed-depth=$SEED_DEPTH
@@ -133,7 +123,7 @@ TRAIN_ARGS=(
     --seed-tpp=$SEED_TPP
     --n-embd=$N_EMBD
     --run=$WANDB_RUN
-    --model-tag=${MODEL_TAG:-d${TARGET_DEPTH}_stacked}
+    --model-tag=${MODEL_TAG:-d12_stacked_debug}
     --window-pattern=$WINDOW_PATTERN
     --target-param-data-ratio=$TARGET_RATIO
     --device-batch-size=$DEVICE_BATCH_SIZE

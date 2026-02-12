@@ -328,11 +328,15 @@ def _stack_matrix_state(new_state, seed_optim_states, seed_group, kind,
 
     def _gather_full(key):
         chunks = []
+        target_device = None
         for r in range(world_size):
             first_idx = seed_group['params'][0]
             r_state = seed_optim_states[r]['state']
             if first_idx in r_state and key in r_state[first_idx]:
-                chunks.append(r_state[first_idx][key])
+                tensor = r_state[first_idx][key]
+                if target_device is None:
+                    target_device = torch.device('cuda', rank)
+                chunks.append(tensor.to(target_device))
             else:
                 return None
         return torch.cat(chunks, dim=0)[:seed_n_params]
@@ -391,14 +395,23 @@ seed_model = setup_fp8(seed_model)
 orig_seed_model = seed_model
 seed_model = torch.compile(seed_model, dynamic=False)
 
-# Compute seed training params
-seed_iters, seed_lr_scale, seed_matrix_lr, seed_wd = compute_training_params(
+# Compute training iterations for both phases
+# NOTE: Using unified hyperparameters from target model for both phases
+temp_target_model = build_model(args.target_depth, args.n_embd)
+target_iters, target_lr_scale, target_matrix_lr, target_wd = compute_training_params(
+    temp_target_model, args.target_param_data_ratio, args.total_batch_size
+)
+del temp_target_model
+
+seed_iters, _, _, _ = compute_training_params(
     seed_model, args.seed_tpp, args.total_batch_size
 )
-print0(f"Seed training: {seed_iters} iterations, batch_size={args.total_batch_size}")
+total_iters = seed_iters + target_iters
+print0(f"Total iterations: {total_iters} (seed: {seed_iters}, target: {target_iters})")
+print0(f"Using unified hyperparameters from target model: lr_scale={target_lr_scale:.4f}, matrix_lr={target_matrix_lr:.4f}, wd={target_wd:.6f}")
 
-# Seed optimizer
-seed_optimizer = create_optimizer(seed_model, seed_lr_scale, seed_matrix_lr, seed_wd)
+# Seed optimizer (using target model hyperparameters!)
+seed_optimizer = create_optimizer(seed_model, target_lr_scale, target_matrix_lr, target_wd)
 for g in seed_optimizer.param_groups:
     g["initial_lr"] = g["lr"]
 
@@ -435,39 +448,87 @@ def get_muon_momentum(it):
     frac = min(it / 300, 1)
     return (1 - frac) * 0.85 + frac * 0.95
 
+# Evaluate at step 0 (before training)
+print0("Evaluating at step 0...")
+seed_model.eval()
+val_loader = build_val_loader()
+eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+with disable_fp8(seed_model), autocast_ctx:
+    val_bpb_step0 = evaluate_bpb(seed_model, val_loader, eval_steps, token_bytes)
+print0(f"Step 0 | Validation bpb: {val_bpb_step0:.6f}")
+wandb_run.log({"step": 0, "val/bpb": val_bpb_step0})
+seed_model.train()
+
 # Seed training loop
 print0(f"Starting seed training for {seed_iters} steps...")
 seed_total_time = 0
+smooth_train_loss = 0
+ema_beta = 0.9
+
 for step in range(seed_iters):
+    global_step = step  # Phase 1: global_step = 0 to seed_iters-1
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = seed_model(x, y)
+        train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader)
 
-    lrm_adam = get_lr_multiplier(step, seed_iters, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
-    lrm_matrix = get_lr_multiplier(step, seed_iters, args.matrix_warmup_ratio, args.matrix_warmdown_ratio, args.final_lr_frac)
+    # Use unified LR schedule across total_iters
+    lrm_adam = get_lr_multiplier(global_step, total_iters, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
+    lrm_matrix = get_lr_multiplier(global_step, total_iters, args.matrix_warmup_ratio, args.matrix_warmdown_ratio, args.final_lr_frac)
     for group in seed_optimizer.param_groups:
         if group['kind'] in {'muon', 'hyperball'}:
             group["lr"] = group["initial_lr"] * lrm_matrix
-            group["momentum"] = get_muon_momentum(step)
+            group["momentum"] = get_muon_momentum(global_step)
         else:
             group["lr"] = group["initial_lr"] * lrm_adam
         if group['kind'] == 'muon':
-            group["weight_decay"] = seed_wd * (1 - step / seed_iters)
+            group["weight_decay"] = target_wd * (1 - global_step / total_iters)
     seed_optimizer.step()
     seed_model.zero_grad(set_to_none=True)
+    train_loss_f = train_loss.item()
 
     synchronize()
     dt = time.time() - t0
     if step > 5:
         seed_total_time += dt
 
-    if step % 25 == 0 or step == seed_iters - 1:
-        print0(f"  Seed step {step:04d}/{seed_iters} | dt: {dt*1000:.0f}ms")
+    # EMA smoothing for train loss
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+
+    # Print progress every step
+    print0(f"  Phase 1 step {step:04d}/{seed_iters} | global_step {global_step:05d}/{total_iters} | loss: {debiased_smooth_loss:.6f} | lrm_adam={lrm_adam:.2f}, lrm_matrix={lrm_matrix:.2f} | dt: {dt*1000:.0f}ms")
+
+    # Log train loss to wandb every 100 global steps
+    if global_step % 100 == 0:
+        wandb_run.log({"step": global_step, "train/loss": debiased_smooth_loss,
+                       "train/lrm_adam": lrm_adam, "train/lrm_matrix": lrm_matrix})
+
+    # Validation every 125 global steps
+    if global_step > 0 and global_step % 125 == 0:
+        seed_model.eval()
+        val_loader = build_val_loader()
+        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        with disable_fp8(seed_model), autocast_ctx:
+            val_bpb = evaluate_bpb(seed_model, val_loader, eval_steps, token_bytes)
+        print0(f"  Global step {global_step:05d} | Validation bpb: {val_bpb:.6f}")
+        wandb_run.log({"step": global_step, "val/bpb": val_bpb})
+        seed_model.train()
+
+    # CORE metrics every 1000 global steps
+    if global_step > 0 and global_step % 1000 == 0:
+        seed_model.eval()
+        with disable_fp8(orig_seed_model), autocast_ctx:
+            results = evaluate_core(orig_seed_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        print0(f"  Global step {global_step:05d} | CORE metric: {results['core_metric']:.4f}")
+        wandb_run.log({"step": global_step, "core_metric": results["core_metric"],
+                       "centered_results": results["centered_results"]})
+        seed_model.train()
 
     if step == 0:
         gc.collect(); gc.freeze(); gc.disable()
@@ -517,10 +578,8 @@ target_model = setup_fp8(target_model)
 orig_target_model = target_model
 target_model = torch.compile(target_model, dynamic=False)
 
-target_iters, target_lr_scale, target_matrix_lr, target_wd = compute_training_params(
-    target_model, args.target_param_data_ratio, args.total_batch_size
-)
-print0(f"Target training: {target_iters} iterations")
+# Use same hyperparameters as seed phase (already computed from target model)
+print0(f"Target training: {target_iters} iterations (using unified hyperparameters)")
 
 target_optimizer = create_optimizer(target_model, target_lr_scale, target_matrix_lr, target_wd)
 for g in target_optimizer.param_groups:
@@ -557,8 +616,8 @@ num_flops_per_token = target_model.estimate_flops()
 num_scaling_params = get_scaling_params(target_model)
 
 # Weight decay scheduler for Phase 2
-def get_weight_decay_p2(it):
-    return target_wd * (1 - it / target_iters)
+def get_weight_decay(it, total_it, wd):
+    return wd * (1 - it / total_it)
 
 # Loop state
 step = 0
@@ -573,28 +632,31 @@ while True:
     last_step = step == target_iters
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # Eval val BPB
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    # Compute global_step for this iteration (needed for logging)
+    current_global_step = seed_iters + step
+
+    # Eval val BPB every 125 global steps
+    if current_global_step > 0 and current_global_step % 125 == 0:
         target_model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(target_model), autocast_ctx:
             val_bpb = evaluate_bpb(target_model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+        print0(f"Global step {current_global_step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({"step": step, "total_training_flops": flops_so_far,
+        wandb_run.log({"step": current_global_step, "total_training_flops": flops_so_far,
                        "total_training_time": total_training_time, "val/bpb": val_bpb})
         target_model.train()
 
-    # CORE metric
+    # CORE metric every 1000 global steps
     results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    if current_global_step > 0 and current_global_step % 1000 == 0:
         target_model.eval()
         with disable_fp8(orig_target_model), autocast_ctx:
             results = evaluate_core(orig_target_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({"step": step, "total_training_flops": flops_so_far,
+        print0(f"Global step {current_global_step:05d} | CORE metric: {results['core_metric']:.4f}")
+        wandb_run.log({"step": current_global_step, "total_training_flops": flops_so_far,
                        "core_metric": results["core_metric"], "centered_results": results["centered_results"]})
         target_model.train()
 
@@ -637,10 +699,14 @@ while True:
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader)
 
-    lrm_adam = get_lr_multiplier(step, target_iters, args.stack_warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
-    lrm_matrix = get_lr_multiplier(step, target_iters, args.stack_warmup_ratio, args.matrix_warmdown_ratio, args.final_lr_frac)
-    muon_momentum = get_muon_momentum(step)
-    muon_wd = get_weight_decay_p2(step)
+    # Phase 2: global_step = seed_iters to total_iters-1
+    global_step = seed_iters + step
+
+    # Use unified LR schedule across total_iters
+    lrm_adam = get_lr_multiplier(global_step, total_iters, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
+    lrm_matrix = get_lr_multiplier(global_step, total_iters, args.matrix_warmup_ratio, args.matrix_warmdown_ratio, args.final_lr_frac)
+    muon_momentum = get_muon_momentum(global_step)
+    muon_wd = get_weight_decay(global_step, total_iters, target_wd)
     for group in target_optimizer.param_groups:
         if group['kind'] in {'muon', 'hyperball'}:
             group["lr"] = group["initial_lr"] * lrm_matrix
@@ -660,7 +726,7 @@ while True:
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * step / target_iters
+    pct_done = 100 * global_step / total_iters
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
@@ -673,9 +739,13 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{target_iters:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm(adam)={lrm_adam:.2f}, lrm(matrix)={lrm_matrix:.2f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
-        wandb_run.log({"step": step, "total_training_flops": flops_so_far,
+
+    # Print every step with global_step
+    print0(f"Phase 2 step {step:05d}/{target_iters:05d} | global_step {global_step:05d}/{total_iters} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm(adam)={lrm_adam:.2f}, lrm(matrix)={lrm_matrix:.2f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+
+    # Log train loss to wandb every 100 global steps
+    if global_step % 100 == 0:
+        wandb_run.log({"step": global_step, "total_training_flops": flops_so_far,
                        "total_training_time": total_training_time,
                        "train/loss": debiased_smooth_loss, "train/lrm_adam": lrm_adam,
                        "train/lrm_matrix": lrm_matrix, "train/dt": dt,
