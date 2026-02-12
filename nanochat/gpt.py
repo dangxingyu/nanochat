@@ -103,19 +103,19 @@ class CausalSelfAttention(nn.Module):
         self.v_proj_scalar = nn.Parameter(torch.zeros(self.n_kv_head)) if has_ve(layer_idx, config.n_layer) else None
         self.c_proj_scalar = nn.Parameter(torch.zeros(config.n_embd))
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, gamma):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values (gamma folded into weights)
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = reparam_linear(self.c_q, x, gamma=gamma).view(B, T, self.n_head, self.head_dim)
-        k = reparam_linear(self.c_k, x, gamma=gamma).view(B, T, self.n_kv_head, self.head_dim)
-        v = reparam_linear(self.c_v, x, gamma=gamma).view(B, T, self.n_kv_head, self.head_dim)
+        q = reparam_linear(self.c_q, x).view(B, T, self.n_head, self.head_dim)
+        k = reparam_linear(self.c_k, x).view(B, T, self.n_kv_head, self.head_dim)
+        v = reparam_linear(self.c_v, x).view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(reparam_linear(self.ve_gate, x[..., :self.ve_gate_channels], gamma=gamma[:self.ve_gate_channels], scalar=self.v_proj_scalar))  # (B, T, n_kv_head), range (0, 2)
+            gate = 2 * torch.sigmoid(reparam_linear(self.ve_gate, x[..., :self.ve_gate_channels], scalar=self.v_proj_scalar))  # (B, T, n_kv_head), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
@@ -155,8 +155,8 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj_scalar = nn.Parameter(torch.zeros(config.n_embd))
 
-    def forward(self, x, gamma):
-        x = reparam_linear(self.c_fc, x, gamma=gamma)
+    def forward(self, x):
+        x = reparam_linear(self.c_fc, x)
         x = F.relu(x).square()
         x = reparam_linear(self.c_proj, x, scalar=self.c_proj_scalar)
         return x
@@ -165,14 +165,12 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn_gamma = nn.Parameter(torch.ones(config.n_embd))
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp_gamma = nn.Parameter(torch.ones(config.n_embd))
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, self.attn_gamma)
-        x = x + self.mlp(norm(x), self.mlp_gamma)
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x))
         return x
 
 
@@ -232,17 +230,11 @@ class GPT(nn.Module):
             attn.c_proj:     uniform, std=1/sqrt(n_embd)
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
             mlp.c_proj:      uniform, std=1/sqrt(n_embd)
-        gamma (RMSNorm):     ones (folded into weights via reparam_linear)
         """
 
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-
-        # Block gamma parameters (learnable RMSNorm weight, folded into linear weights via reparam_linear)
-        for block in self.transformer.h:
-            block.attn_gamma.fill_(1.0)
-            block.mlp_gamma.fill_(1.0)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -270,12 +262,6 @@ class GPT(nn.Module):
                 block.mlp.c_proj_scalar.data = block.mlp.c_proj_scalar.data.to(torch.bfloat16)
                 if block.attn.v_proj_scalar is not None:
                     block.attn.v_proj_scalar.data = block.attn.v_proj_scalar.data.to(torch.bfloat16)
-
-        # Block gamma parameters (cast to bf16)
-        for block in self.transformer.h:
-            if self.transformer.wte.weight.device.type == "cuda":
-                block.attn_gamma.data = block.attn_gamma.data.to(torch.bfloat16)
-                block.mlp_gamma.data = block.mlp_gamma.data.to(torch.bfloat16)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
