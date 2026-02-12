@@ -28,7 +28,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, create_stacked_model_state, create_stacked_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -73,6 +73,9 @@ parser.add_argument("--matrix-warmup-ratio", type=float, default=0.0, help="rati
 parser.add_argument("--matrix-warmdown-ratio", type=float, default=1.0, help="ratio of iterations for Muon/Hyperball LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+# Layer stacking
+parser.add_argument("--stack-from", type=str, default=None, help="stack from seed checkpoint dir (e.g. cache/base_checkpoints/d6_seed)")
+parser.add_argument("--seed-step", type=int, default=-1, help="seed checkpoint step (-1 = auto-detect last)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
@@ -127,12 +130,15 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
+def build_model_meta(depth, model_dim_override=None):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-    base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+    if model_dim_override is not None:
+        model_dim = model_dim_override
+    else:
+        base_dim = depth * args.aspect_ratio
+        model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
@@ -143,13 +149,41 @@ def build_model_meta(depth):
         model_meta = GPT(config)
     return model_meta
 
-# Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+# Stacking setup: load seed config to determine model width
+stacking = args.stack_from is not None
+seed_meta = None
+seed_model_data = None
+seed_n_layer = None
+if stacking:
+    from nanochat.checkpoint_manager import find_last_step
+    seed_dir = args.stack_from
+    seed_step = args.seed_step
+    if seed_step == -1:
+        seed_step = find_last_step(seed_dir)
+    print0(f"Stacking from {seed_dir} step {seed_step} -> target depth {args.depth}")
+    seed_model_data, _, seed_meta = load_checkpoint(seed_dir, seed_step, device, load_optimizer=False)
+    seed_model_config = seed_meta["model_config"]
+    seed_n_layer = seed_model_config["n_layer"]
+    seed_n_embd = seed_model_config["n_embd"]
+    assert args.depth % seed_n_layer == 0, f"Target depth {args.depth} must be a multiple of seed depth {seed_n_layer}"
+    print0(f"Seed model: depth={seed_n_layer}, n_embd={seed_n_embd}")
+    # Build target model with seed width
+    model = build_model_meta(args.depth, model_dim_override=seed_n_embd)
+else:
+    model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+
+# If stacking, create stacked model state and load it
+if stacking:
+    print0(f"Creating stacked model state: {seed_n_layer} layers -> {args.depth} layers")
+    stacked_model_state = create_stacked_model_state(seed_model_data, seed_n_layer, args.depth)
+    model.load_state_dict(stacked_model_state, strict=True, assign=True)
+    del stacked_model_state, seed_model_data
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -321,7 +355,26 @@ optimizer = model.setup_optimizer(
     matrix_optimizer=args.matrix_optimizer,
 )
 
-if resuming:
+if stacking:
+    # Load all ranks' seed optimizer states and create stacked optimizer state
+    print0(f"Creating stacked optimizer state for rank {ddp_rank}...")
+    seed_optim_states = []
+    for r in range(ddp_world_size):
+        _, optim_data_r, _ = load_checkpoint(seed_dir, seed_step, device, load_optimizer=True, rank=r)
+        seed_optim_states.append(optim_data_r)
+    # Build seed model on meta device for structure reference
+    seed_model_ref = build_model_meta(seed_n_layer, model_dim_override=seed_meta["model_config"]["n_embd"])
+    seed_model_ref.to_empty(device=device)
+    seed_model_ref.init_weights()
+    # Build target model reference (same as our model, but uncompiled)
+    stacked_optim_state = create_stacked_optimizer_state(
+        seed_optim_states, seed_n_layer, args.depth,
+        seed_model_ref, orig_model, ddp_rank, ddp_world_size,
+    )
+    optimizer.load_state_dict(stacked_optim_state)
+    del seed_optim_states, stacked_optim_state, seed_model_ref
+    print0("Stacked optimizer state loaded successfully")
+elif resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 

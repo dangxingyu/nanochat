@@ -144,6 +144,252 @@ def find_last_step(checkpoint_dir):
     return last_step
 
 # -----------------------------------------------------------------------------
+# Layer stacking utilities
+
+def create_stacked_model_state(seed_state, seed_n_layer, target_n_layer):
+    """
+    Create a model state dict for a deeper model by repeating seed layers.
+    Pattern: [0,1,...,S-1, 0,1,...,S-1, ...] until target_n_layer.
+    """
+    from nanochat.gpt import has_ve
+    new_state = {}
+    num_repeats = (target_n_layer + seed_n_layer - 1) // seed_n_layer
+
+    # 1) Copy shared params (embeddings, lm_head) directly
+    for key, val in seed_state.items():
+        if key.startswith('transformer.wte') or key.startswith('lm_head'):
+            new_state[key] = val.clone()
+
+    # 2) Repeat per-layer scalars
+    for key in ['resid_lambdas', 'x0_lambdas']:
+        new_state[key] = seed_state[key].repeat(num_repeats)[:target_n_layer]
+
+    # 3) Duplicate transformer blocks
+    for target_layer in range(target_n_layer):
+        source_layer = target_layer % seed_n_layer
+        for key in seed_state:
+            prefix = f'transformer.h.{source_layer}.'
+            if key.startswith(prefix):
+                suffix = key[len(prefix):]
+                new_key = f'transformer.h.{target_layer}.{suffix}'
+                new_state[new_key] = seed_state[key].clone()
+
+    # 4) Duplicate value embeddings
+    for target_layer in range(target_n_layer):
+        if has_ve(target_layer, target_n_layer):
+            source_layer = target_layer % seed_n_layer
+            source_key = f'value_embeds.{source_layer}.weight'
+            target_key = f'value_embeds.{target_layer}.weight'
+            if source_key in seed_state:
+                new_state[target_key] = seed_state[source_key].clone()
+            else:
+                log0(f"Warning: seed layer {source_layer} has no value_embeds, target layer {target_layer} needs one")
+
+    return new_state
+
+
+def create_stacked_optimizer_state(seed_optim_states, seed_n_layer, target_n_layer,
+                                   seed_model, target_model, rank, world_size):
+    """
+    Create a stacked optimizer state dict for a single rank.
+
+    Args:
+        seed_optim_states: list of optimizer state dicts, one per rank (loaded from all rank files)
+        seed_n_layer: number of layers in seed model
+        target_n_layer: number of layers in target model
+        seed_model: the seed GPT model (for parameter structure reference)
+        target_model: the target GPT model (for parameter structure reference)
+        rank: this rank's index
+        world_size: total number of ranks
+    """
+    num_repeats = target_n_layer // seed_n_layer
+    # We'll use rank 0's state dict as the structural reference
+    seed_sd = seed_optim_states[0]
+    seed_groups = seed_sd['param_groups']
+    seed_states = seed_sd['state']
+
+    # Build the target optimizer to get param_groups structure
+    # We need to know: for each group, how many params, and their shapes
+    seed_param_groups_info = _get_param_groups_info(seed_model, seed_n_layer)
+    target_param_groups_info = _get_param_groups_info(target_model, target_n_layer)
+
+    new_state = {}
+    new_param_groups = []
+    param_counter = 0
+
+    for gi, (seed_group, seed_info, target_info) in enumerate(
+        zip(seed_groups, seed_param_groups_info, target_param_groups_info)
+    ):
+        kind = seed_group['kind']
+        seed_n_params = seed_info['n_params']
+        target_n_params = target_info['n_params']
+
+        # Build new param_group entry (copy hyperparams, update param indices)
+        new_group = {k: v for k, v in seed_group.items() if k != 'params'}
+        new_param_indices = list(range(param_counter, param_counter + target_n_params))
+        new_group['params'] = new_param_indices
+
+        if kind == 'adamw':
+            _stack_adamw_group_state(
+                new_state, seed_optim_states, seed_states, seed_group,
+                seed_info, target_info, param_counter,
+                rank, world_size, num_repeats
+            )
+        elif kind in ('muon', 'hyperball'):
+            _stack_matrix_group_state(
+                new_state, seed_optim_states, seed_group, kind,
+                seed_info, target_info, param_counter,
+                rank, world_size, num_repeats
+            )
+
+        new_param_groups.append(new_group)
+        param_counter += target_n_params
+
+    return {'state': new_state, 'param_groups': new_param_groups}
+
+
+def _get_param_groups_info(model, n_layer):
+    """Extract parameter group structure info from a model (mirrors setup_optimizer ordering)."""
+    from nanochat.gpt import has_ve
+    block_matrix_params = [p for p in model.transformer.h.parameters() if p.ndim == 2]
+    block_1d_params = [p for p in model.transformer.h.parameters() if p.ndim == 1]
+    value_embeds_params = list(model.value_embeds.parameters())
+
+    infos = [
+        {'name': 'lm_head', 'n_params': 1, 'shapes': [model.lm_head.weight.shape], 'category': 'shared'},
+        {'name': 'wte', 'n_params': 1, 'shapes': [model.transformer.wte.weight.shape], 'category': 'shared'},
+        {'name': 'value_embeds', 'n_params': len(value_embeds_params),
+         'shapes': [p.shape for p in value_embeds_params], 'category': 'per_layer_ve'},
+        {'name': 'resid_lambdas', 'n_params': 1, 'shapes': [model.resid_lambdas.shape], 'category': 'scalar_expand'},
+        {'name': 'x0_lambdas', 'n_params': 1, 'shapes': [model.x0_lambdas.shape], 'category': 'scalar_expand'},
+        {'name': 'block_1d', 'n_params': len(block_1d_params),
+         'shapes': [p.shape for p in block_1d_params], 'category': 'per_layer_1d'},
+    ]
+
+    # Matrix groups by shape (same ordering as setup_optimizer)
+    for shape in sorted({p.shape for p in block_matrix_params}):
+        group_params = [p for p in block_matrix_params if p.shape == shape]
+        infos.append({
+            'name': f'matrix_{shape}', 'n_params': len(group_params),
+            'shapes': [shape] * len(group_params), 'category': 'matrix',
+            'shape': shape,
+        })
+
+    return infos
+
+
+def _stack_adamw_group_state(new_state, seed_optim_states, seed_states, seed_group,
+                              seed_info, target_info, param_offset,
+                              rank, world_size, num_repeats):
+    """Stack AdamW optimizer state for a parameter group."""
+    seed_param_indices = seed_group['params']
+    category = seed_info['category']
+
+    if category == 'shared':
+        # Shared params (lm_head, wte): copy state directly from this rank
+        rank_sd = seed_optim_states[rank]
+        for i, seed_idx in enumerate(seed_param_indices):
+            if seed_idx in rank_sd['state']:
+                state = rank_sd['state'][seed_idx]
+                new_state[param_offset + i] = {k: v.clone() for k, v in state.items()}
+
+    elif category == 'scalar_expand':
+        # resid_lambdas, x0_lambdas: single param whose shape grows from (seed_n,) to (target_n,)
+        # State is replicated (small param), so just use this rank's state
+        rank_sd = seed_optim_states[rank]
+        for i, seed_idx in enumerate(seed_param_indices):
+            if seed_idx in rank_sd['state']:
+                state = rank_sd['state'][seed_idx]
+                new_entry = {}
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor) and v.ndim >= 1:
+                        new_entry[k] = v.repeat(num_repeats)[:target_info['shapes'][i][0]]
+                    else:
+                        new_entry[k] = v
+                new_state[param_offset + i] = new_entry
+
+    elif category in ('per_layer_ve', 'per_layer_1d'):
+        # Per-layer params that get duplicated: copy state in repeating pattern
+        rank_sd = seed_optim_states[rank]
+        seed_n = len(seed_param_indices)
+        target_n = target_info['n_params']
+        for i in range(target_n):
+            seed_local_idx = i % seed_n
+            seed_idx = seed_param_indices[seed_local_idx]
+            if seed_idx in rank_sd['state']:
+                state = rank_sd['state'][seed_idx]
+                new_state[param_offset + i] = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                                                 for k, v in state.items()}
+
+
+def _stack_matrix_group_state(new_state, seed_optim_states, seed_group, kind,
+                               seed_info, target_info, param_offset,
+                               rank, world_size, num_repeats):
+    """Stack Muon/Hyperball optimizer state for a matrix parameter group."""
+    seed_n_params = seed_info['n_params']
+    target_n_params = target_info['n_params']
+    shape = seed_info['shape']
+
+    seed_chunk_size = (seed_n_params + world_size - 1) // world_size
+    target_chunk_size = (target_n_params + world_size - 1) // world_size
+
+    # Reconstruct full momentum buffers from all ranks
+    def _gather_full_buffer(key):
+        chunks = []
+        for r in range(world_size):
+            r_sd = seed_optim_states[r]
+            first_idx = seed_group['params'][0]
+            if first_idx in r_sd['state'] and key in r_sd['state'][first_idx]:
+                chunks.append(r_sd['state'][first_idx][key])
+            else:
+                return None
+        # Concatenate all rank chunks, trim to actual seed_n_params
+        full = torch.cat(chunks, dim=0)[:seed_n_params]
+        return full
+
+    full_momentum = _gather_full_buffer('momentum_buffer')
+    full_second_momentum = _gather_full_buffer('second_momentum_buffer')
+    full_p_norm = _gather_full_buffer('p_norm') if kind == 'hyperball' else None
+
+    # If no state exists yet (seed optimizer not stepped), skip
+    if full_momentum is None:
+        return
+
+    # Repeat to target size
+    stacked_momentum = full_momentum.repeat(num_repeats, *([1] * (full_momentum.ndim - 1)))[:target_n_params]
+    stacked_second = full_second_momentum.repeat(num_repeats, *([1] * (full_second_momentum.ndim - 1)))[:target_n_params]
+
+    # Shard for this rank
+    start = rank * target_chunk_size
+    end = start + target_chunk_size
+    chunk_momentum = torch.zeros(target_chunk_size, *stacked_momentum.shape[1:],
+                                  dtype=stacked_momentum.dtype, device=stacked_momentum.device)
+    chunk_second = torch.zeros(target_chunk_size, *stacked_second.shape[1:],
+                                dtype=stacked_second.dtype, device=stacked_second.device)
+    num_owned = min(target_chunk_size, max(0, target_n_params - start))
+    if num_owned > 0:
+        chunk_momentum[:num_owned] = stacked_momentum[start:start + num_owned]
+        chunk_second[:num_owned] = stacked_second[start:start + num_owned]
+
+    # Store state at first param index of the group
+    first_param_idx = param_offset
+    entry = {
+        'momentum_buffer': chunk_momentum,
+        'second_momentum_buffer': chunk_second,
+    }
+
+    if full_p_norm is not None:
+        stacked_p_norm = full_p_norm.repeat(num_repeats, *([1] * (full_p_norm.ndim - 1)))[:target_n_params]
+        chunk_p_norm = torch.zeros(target_chunk_size, *stacked_p_norm.shape[1:],
+                                    dtype=stacked_p_norm.dtype, device=stacked_p_norm.device)
+        if num_owned > 0:
+            chunk_p_norm[:num_owned] = stacked_p_norm[start:start + num_owned]
+        entry['p_norm'] = chunk_p_norm
+
+    new_state[first_param_idx] = entry
+
+
+# -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
 def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
