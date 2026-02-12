@@ -1,27 +1,17 @@
 #!/bin/bash
 
-# Stack training: train a 6-layer seed model for 1 TPP, then stack layers to target depth
-# and continue training. Everything happens in a single process, in-memory.
-#
-# The seed model uses d12 width (768 dim, 6 heads).
-# After seed training, layers are stacked as [0,1,2,3,4,5, 0,1,2,3,4,5, ...].
-# Optimizer state is properly duplicated and re-sharded across ranks.
-#
-# Examples:
-#   bash runs/stack_train.sh                     # default: stack 6->24
-#   TARGET_DEPTH=12 bash runs/stack_train.sh     # stack 6->12
-#   TARGET_DEPTH=48 bash runs/stack_train.sh     # stack 6->48
+# Debug: Stack 12 -> 24 with seed TPP=2.0
 
 set -e
 
 # -----------------------------------------------------------------------------
 # Config
 
-SEED_DEPTH="${SEED_DEPTH:-6}"
-TARGET_DEPTH="${TARGET_DEPTH:-10.5}"
+SEED_DEPTH="${SEED_DEPTH:-12}"
+TARGET_DEPTH="${TARGET_DEPTH:-24}"
 SEED_TPP="${SEED_TPP:-4.0}"
-TARGET_RATIO="${TARGET_RATIO:-10.5}"
-N_EMBD="${N_EMBD:-768}"
+TARGET_RATIO="${TARGET_RATIO:-12.5}"
+ASPECT_RATIO="${ASPECT_RATIO:-64}"  # n_embd will be auto-computed from target_depth
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
 TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"
@@ -47,7 +37,7 @@ NORM_LR="${NORM_LR:-0.1}"
 # Wandb
 export WANDB_ENTITY="${WANDB_ENTITY:-xingyu20}"
 export WANDB_PROJECT="${WANDB_PROJECT:-nanochat}"
-WANDB_RUN="${WANDB_RUN:-stack_d${SEED_DEPTH}_to_d${TARGET_DEPTH}}"
+WANDB_RUN="${WANDB_RUN:-stack_d12_d24_stpp4}"
 
 # FP8 (default enabled)
 FP8="${FP8:-1}"
@@ -76,10 +66,11 @@ mkdir -p "$NANOCHAT_BASE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$T
 # Print summary
 
 echo "=============================================="
-echo "Stack Training (in-memory)"
+echo "Stack Training Debug: 12 -> 24"
 echo "=============================================="
 echo "Project root:      $PROJECT_ROOT"
-echo "Seed depth:        $SEED_DEPTH (n_embd=$N_EMBD)"
+echo "Seed depth:        $SEED_DEPTH"
+echo "Aspect ratio:      $ASPECT_RATIO (n_embd auto-computed)"
 echo "Seed TPP:          $SEED_TPP"
 echo "Target depth:      $TARGET_DEPTH"
 echo "Target ratio:      $TARGET_RATIO"
@@ -122,18 +113,18 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Train (single script, both phases in-memory)
+# Train
 
 echo ""
-echo "Starting stack training (seed -> stack -> continue)..."
+echo "Starting stack training (12 -> 24, seed TPP=2.0)..."
 
 TRAIN_ARGS=(
     --seed-depth=$SEED_DEPTH
     --target-depth=$TARGET_DEPTH
     --seed-tpp=$SEED_TPP
-    --n-embd=$N_EMBD
+    --aspect-ratio=$ASPECT_RATIO
     --run=$WANDB_RUN
-    --model-tag=${MODEL_TAG:-d${TARGET_DEPTH}_stacked}
+    --model-tag=${MODEL_TAG:-d24_stacked_debug}
     --window-pattern=$WINDOW_PATTERN
     --target-param-data-ratio=$TARGET_RATIO
     --device-batch-size=$DEVICE_BATCH_SIZE

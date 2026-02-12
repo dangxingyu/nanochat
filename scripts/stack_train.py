@@ -45,7 +45,8 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--seed-depth", type=int, default=6, help="depth of the seed model")
 parser.add_argument("--target-depth", type=int, default=24, help="target depth after stacking")
 parser.add_argument("--seed-tpp", type=float, default=1.0, help="tokens-per-parameter for seed training")
-parser.add_argument("--n-embd", type=int, default=768, help="model width (must match d12: 768)")
+parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
+parser.add_argument("--n-embd", type=int, default=None, help="model width (default: auto-compute from target depth)")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern")
@@ -79,6 +80,13 @@ parser.add_argument("--save-every", type=int, default=-1)
 # Output
 parser.add_argument("--model-tag", type=str, default=None)
 args = parser.parse_args()
+
+# Auto-compute n_embd from target depth if not provided (same as base_train)
+if args.n_embd is None:
+    base_dim = args.target_depth * args.aspect_ratio
+    args.n_embd = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+    print(f"Auto-computed n_embd={args.n_embd} from target_depth={args.target_depth}, aspect_ratio={args.aspect_ratio}")
+
 user_config = vars(args).copy()
 
 assert args.target_depth % args.seed_depth == 0, \
@@ -397,17 +405,27 @@ seed_model = torch.compile(seed_model, dynamic=False)
 
 # Compute training iterations for both phases
 # NOTE: Using unified hyperparameters from target model for both phases
+# The target model trains for FEWER steps (deduct seed steps from target steps)
 temp_target_model = build_model(args.target_depth, args.n_embd)
-target_iters, target_lr_scale, target_matrix_lr, target_wd = compute_training_params(
+
+# Compute seed_iters based on seed model
+seed_iters, _, _, _ = compute_training_params(
+    seed_model, args.seed_tpp, args.total_batch_size
+)
+
+# Compute total target iters and hyperparameters
+total_target_iters, target_lr_scale, target_matrix_lr, target_wd = compute_training_params(
     temp_target_model, args.target_param_data_ratio, args.total_batch_size
 )
 del temp_target_model
 
-seed_iters, _, _, _ = compute_training_params(
-    seed_model, args.seed_tpp, args.total_batch_size
-)
-total_iters = seed_iters + target_iters
-print0(f"Total iterations: {total_iters} (seed: {seed_iters}, target: {target_iters})")
+# Target phase trains for remaining steps (subtract seed steps)
+target_iters = total_target_iters - seed_iters
+
+total_iters = total_target_iters  # Total training in terms of target model's TPP
+print0(f"Total iterations: {total_iters}")
+print0(f"  Phase 1 (seed): {seed_iters} steps")
+print0(f"  Phase 2 (target): {target_iters} steps (deducted {seed_iters} seed steps)")
 print0(f"Using unified hyperparameters from target model: lr_scale={target_lr_scale:.4f}, matrix_lr={target_matrix_lr:.4f}, wd={target_wd:.6f}")
 
 # Seed optimizer (using target model hyperparameters!)
@@ -447,6 +465,9 @@ def get_lr_multiplier(it, num_iters, warmup_ratio, warmdown_ratio, final_lr_frac
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
     return (1 - frac) * 0.85 + frac * 0.95
+
+# Calculate FLOPs for seed model (for MFU logging)
+num_flops_per_token = orig_seed_model.estimate_flops()
 
 # Evaluate at step 0 (before training)
 print0("Evaluating at step 0...")
@@ -501,16 +522,22 @@ for step in range(seed_iters):
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
 
+    # Compute MFU
+    tok_per_sec = int(args.total_batch_size / dt)
+    flops_per_sec = num_flops_per_token * args.total_batch_size / dt
+    mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
+
     # Print progress every step
-    print0(f"  Phase 1 step {step:04d}/{seed_iters} | global_step {global_step:05d}/{total_iters} | loss: {debiased_smooth_loss:.6f} | lrm_adam={lrm_adam:.2f}, lrm_matrix={lrm_matrix:.2f} | dt: {dt*1000:.0f}ms")
+    print0(f"  Phase 1 step {step:04d}/{seed_iters} | global_step {global_step:05d}/{total_iters} | loss: {debiased_smooth_loss:.6f} | lrm_adam={lrm_adam:.2f}, lrm_matrix={lrm_matrix:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f}")
 
     # Log train loss to wandb every 100 global steps
     if global_step % 100 == 0:
         wandb_run.log({"step": global_step, "train/loss": debiased_smooth_loss,
-                       "train/lrm_adam": lrm_adam, "train/lrm_matrix": lrm_matrix})
+                       "train/lrm_adam": lrm_adam, "train/lrm_matrix": lrm_matrix,
+                       "train/dt": dt, "train/tok_per_sec": tok_per_sec, "train/mfu": mfu})
 
     # Validation every 125 global steps
-    if global_step > 0 and global_step % 125 == 0:
+    if global_step > 0 and global_step % 250 == 0:
         seed_model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -636,7 +663,7 @@ while True:
     current_global_step = seed_iters + step
 
     # Eval val BPB every 125 global steps
-    if current_global_step > 0 and current_global_step % 125 == 0:
+    if current_global_step > 0 and current_global_step % 250 == 0:
         target_model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
