@@ -1,20 +1,20 @@
 #!/bin/bash
 
-# Debug: Stack 12 -> 24 with seed TPP=2.0
+# Stack 6 -> 12 with c_proj zero-init on bottom layers
 
 set -e
 
 # -----------------------------------------------------------------------------
 # Config
 
-SEED_DEPTH="${SEED_DEPTH:-12}"
-TARGET_DEPTH="${TARGET_DEPTH:-24}"
-SEED_TPP="${SEED_TPP:-2.0}"
-TARGET_RATIO="${TARGET_RATIO:-12.5}"
+SEED_DEPTH="${SEED_DEPTH:-6}"
+TARGET_DEPTH="${TARGET_DEPTH:-12}"
+SEED_TPP="${SEED_TPP:-4.0}"
+TARGET_RATIO="${TARGET_RATIO:-10.5}"
 ASPECT_RATIO="${ASPECT_RATIO:-64}"  # n_embd will be auto-computed from target_depth
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
-TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:--1}"
+TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)}"
 if [ "$NPROC_PER_NODE" -eq 0 ]; then
@@ -35,7 +35,7 @@ NORM_LR="${NORM_LR:-0.1}"
 # Wandb
 export WANDB_ENTITY="${WANDB_ENTITY:-xingyu20}"
 export WANDB_PROJECT="${WANDB_PROJECT:-nanochat}"
-WANDB_RUN="${WANDB_RUN:-stack_d12_d24_stpp4_1M}"
+WANDB_RUN="${WANDB_RUN:-stack_d6_d12_zeroinit}"
 
 # FP8 (default enabled)
 FP8="${FP8:-1}"
@@ -64,7 +64,7 @@ mkdir -p "$NANOCHAT_BASE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$T
 # Print summary
 
 echo "=============================================="
-echo "Stack Training Debug: 12 -> 24"
+echo "Stack Training: 6 -> 12 (c_proj zero-init)"
 echo "=============================================="
 echo "Project root:      $PROJECT_ROOT"
 echo "Seed depth:        $SEED_DEPTH"
@@ -113,7 +113,7 @@ fi
 # Train
 
 echo ""
-echo "Starting stack training (12 -> 24, seed TPP=2.0)..."
+echo "Starting stack training (6 -> 12, c_proj zero-init)..."
 
 TRAIN_ARGS=(
     --seed-depth=$SEED_DEPTH
@@ -121,7 +121,7 @@ TRAIN_ARGS=(
     --seed-tpp=$SEED_TPP
     --aspect-ratio=$ASPECT_RATIO
     --run=$WANDB_RUN
-    --model-tag=${MODEL_TAG:-d24_stacked_debug}
+    --model-tag=${MODEL_TAG:-d12_stacked_zeroinit}
     --window-pattern=$WINDOW_PATTERN
     --target-param-data-ratio=$TARGET_RATIO
     --device-batch-size=$DEVICE_BATCH_SIZE

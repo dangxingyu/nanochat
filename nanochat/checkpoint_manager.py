@@ -185,6 +185,17 @@ def create_stacked_model_state(seed_state, seed_n_layer, target_n_layer):
             else:
                 log0(f"Warning: seed layer {source_layer} has no value_embeds, target layer {target_layer} needs one")
 
+    # 5) Zero-init c_proj on bottom layers so they act as pass-through initially.
+    #    Bottom layers = all except the topmost seed_n_layer layers.
+    num_bottom = target_n_layer - seed_n_layer
+    for layer in range(num_bottom):
+        for proj_key in [f'transformer.h.{layer}.attn.c_proj.weight',
+                         f'transformer.h.{layer}.mlp.c_proj.weight']:
+            if proj_key in new_state:
+                new_state[proj_key] = torch.zeros_like(new_state[proj_key])
+    if num_bottom > 0:
+        log0(f"Zero-initialized c_proj weights on bottom {num_bottom} layers (0..{num_bottom-1})")
+
     return new_state
 
 

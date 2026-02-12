@@ -69,7 +69,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.3)
 parser.add_argument("--matrix-warmup-ratio", type=float, default=0.0)
 parser.add_argument("--matrix-warmdown-ratio", type=float, default=1.0)
 parser.add_argument("--final-lr-frac", type=float, default=0.0)
-parser.add_argument("--stack-warmup-ratio", type=float, default=0.05, help="LR warmup ratio for Phase 2 after stacking")
+parser.add_argument("--seed-lr-multiplier", type=float, default=1.0, help="Constant LR multiplier for Phase 1 seed training")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250)
 parser.add_argument("--eval-tokens", type=int, default=40*524288)
@@ -404,8 +404,6 @@ orig_seed_model = seed_model
 seed_model = torch.compile(seed_model, dynamic=False)
 
 # Compute training iterations for both phases
-# NOTE: Using unified hyperparameters from target model for both phases
-# The target model trains for FEWER steps (deduct seed steps from target steps)
 temp_target_model = build_model(args.target_depth, args.n_embd)
 
 # Compute seed_iters based on seed model
@@ -413,20 +411,27 @@ seed_iters, _, _, _ = compute_training_params(
     seed_model, args.seed_tpp, args.total_batch_size
 )
 
-# Compute total target iters and hyperparameters
-total_target_iters, target_lr_scale, target_matrix_lr, target_wd = compute_training_params(
+# Compute total target iters
+total_target_iters, _, _, _ = compute_training_params(
     temp_target_model, args.target_param_data_ratio, args.total_batch_size
 )
-del temp_target_model
 
 # Target phase trains for remaining steps (subtract seed steps)
 target_iters = total_target_iters - seed_iters
 
-total_iters = total_target_iters  # Total training in terms of target model's TPP
+# Compute Phase 2 hyperparams based on Phase 2's token budget (not total)
+phase2_tokens = target_iters * args.total_batch_size
+phase2_ratio = phase2_tokens / get_scaling_params(temp_target_model)
+_, target_lr_scale, target_matrix_lr, target_wd = compute_training_params(
+    temp_target_model, phase2_ratio, args.total_batch_size
+)
+del temp_target_model
+
+total_iters = total_target_iters  # For logging/progress only
 print0(f"Total iterations: {total_iters}")
-print0(f"  Phase 1 (seed): {seed_iters} steps")
-print0(f"  Phase 2 (target): {target_iters} steps (deducted {seed_iters} seed steps)")
-print0(f"Using unified hyperparameters from target model: lr_scale={target_lr_scale:.4f}, matrix_lr={target_matrix_lr:.4f}, wd={target_wd:.6f}")
+print0(f"  Phase 1 (seed): {seed_iters} steps (constant LR, multiplier={args.seed_lr_multiplier})")
+print0(f"  Phase 2 (target): {target_iters} steps (phase2_ratio={phase2_ratio:.2f})")
+print0(f"Phase 2 hyperparameters: lr_scale={target_lr_scale:.4f}, matrix_lr={target_matrix_lr:.4f}, wd={target_wd:.6f}")
 
 # Seed optimizer (using target model hyperparameters!)
 seed_optimizer = create_optimizer(seed_model, target_lr_scale, target_matrix_lr, target_wd)
@@ -498,17 +503,17 @@ for step in range(seed_iters):
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader)
 
-    # Use unified LR schedule across total_iters
-    lrm_adam = get_lr_multiplier(global_step, total_iters, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
-    lrm_matrix = get_lr_multiplier(global_step, total_iters, args.matrix_warmup_ratio, args.matrix_warmdown_ratio, args.final_lr_frac)
+    # Phase 1: constant LR
+    lrm_adam = args.seed_lr_multiplier
+    lrm_matrix = args.seed_lr_multiplier
     for group in seed_optimizer.param_groups:
         if group['kind'] in {'muon', 'hyperball'}:
             group["lr"] = group["initial_lr"] * lrm_matrix
-            group["momentum"] = get_muon_momentum(global_step)
+            group["momentum"] = get_muon_momentum(step)
         else:
             group["lr"] = group["initial_lr"] * lrm_adam
         if group['kind'] == 'muon':
-            group["weight_decay"] = target_wd * (1 - global_step / total_iters)
+            group["weight_decay"] = target_wd
     seed_optimizer.step()
     seed_model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
@@ -726,14 +731,13 @@ while True:
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader)
 
-    # Phase 2: global_step = seed_iters to total_iters-1
+    # Phase 2: local schedule over target_iters
     global_step = seed_iters + step
 
-    # Use unified LR schedule across total_iters
-    lrm_adam = get_lr_multiplier(global_step, total_iters, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
-    lrm_matrix = get_lr_multiplier(global_step, total_iters, args.matrix_warmup_ratio, args.matrix_warmdown_ratio, args.final_lr_frac)
-    muon_momentum = get_muon_momentum(global_step)
-    muon_wd = get_weight_decay(global_step, total_iters, target_wd)
+    lrm_adam = get_lr_multiplier(step, target_iters, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
+    lrm_matrix = get_lr_multiplier(step, target_iters, args.matrix_warmup_ratio, args.matrix_warmdown_ratio, args.final_lr_frac)
+    muon_momentum = get_muon_momentum(step)
+    muon_wd = get_weight_decay(step, target_iters, target_wd)
     for group in target_optimizer.param_groups:
         if group['kind'] in {'muon', 'hyperball'}:
             group["lr"] = group["initial_lr"] * lrm_matrix

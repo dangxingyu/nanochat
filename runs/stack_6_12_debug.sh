@@ -27,8 +27,6 @@ SCALAR_LR="${SCALAR_LR:-0.5}"
 MATRIX_LR="${MATRIX_LR:-0.02}"
 WARMDOWN_RATIO="${WARMDOWN_RATIO:-0.3}"
 MATRIX_WARMDOWN_RATIO="${MATRIX_WARMDOWN_RATIO:-1.0}"
-STACK_WARMUP_RATIO="${STACK_WARMUP_RATIO:-0.05}"
-
 # AdamW
 EMBEDDING_LR="${EMBEDDING_LR:-0.3}"
 UNEMBEDDING_LR="${UNEMBEDDING_LR:-0.004}"
@@ -76,7 +74,6 @@ echo "Target ratio:      $TARGET_RATIO"
 echo "Window pattern:    $WINDOW_PATTERN"
 echo "Num GPUs:          $NPROC_PER_NODE"
 echo "Matrix optimizer:  $MATRIX_OPTIMIZER"
-echo "Stack warmup:      $STACK_WARMUP_RATIO"
 if [ "${FP8:-0}" -eq 1 ]; then
     echo "FP8:               enabled ($FP8_RECIPE)"
 fi
@@ -132,7 +129,6 @@ TRAIN_ARGS=(
     --matrix-lr=$MATRIX_LR
     --warmdown-ratio=$WARMDOWN_RATIO
     --matrix-warmdown-ratio=$MATRIX_WARMDOWN_RATIO
-    --stack-warmup-ratio=$STACK_WARMUP_RATIO
     --embedding-lr=$EMBEDDING_LR
     --unembedding-lr=$UNEMBEDDING_LR
     --norm-lr=$NORM_LR
